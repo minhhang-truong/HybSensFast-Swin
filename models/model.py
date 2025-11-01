@@ -1137,6 +1137,156 @@ class ColorBalancePrior(nn.Module):
         prior = self.enc(x_mean)
 
         return prior
+    
+class FourierSNRGuidedAttention(nn.Module):
+ 
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+
+    def fft_op(self, x):
+        """ Thực hiện FFT và tách Biên độ (Amplitude) và Pha (Phase). """
+        # x: (B, Seq_len, D)
+        # Thực hiện FFT trên chiều Seq_len (dim=1)
+        x_fft = torch.fft.fft(x, dim=1)
+        
+        A = torch.abs(x_fft)
+        P = torch.angle(x_fft)
+        return A, P
+
+    def ifft_op(self, A, P):
+        """ Tổ hợp lại thành số phức và thực hiện IFFT. """
+        # Tổ hợp thành số phức: Complex = A * exp(j * P)
+        complex_tensor = torch.polar(A, P)
+        # Thực hiện IFFT trên chiều thứ 2 (Seq_len) và chỉ lấy phần thực
+        x_ifft = torch.fft.ifft(complex_tensor, dim=1).real
+        return x_ifft
+
+    def forward(self, Q, K):
+        """
+        Args:
+            Q (Tensor): Query từ SNR (B, S, D)
+            K (Tensor): Key từ RGB Feature (B, S, D)
+            V (Tensor): Value từ RGB Feature (B, S, D)
+        """
+        # 1. FFT và tách Biên độ/Pha
+        # Q (SNR) -> As, Ps
+        As, Ps = self.fft_op(Q)
+        # K (RGB) -> Ax, Px
+        Ax, Px = self.fft_op(K)
+
+        # 2. Element-wise Multiplication trong miền tần số
+        # A = Ax * As
+        A = Ax * As 
+        # P = Px * Ps 
+        P = Px * Ps 
+
+        # 3. IFFT về miền không gian
+        F = self.ifft_op(A, P) # F: (B, S, D)
+        
+        # 4. Điều biến (Modulation) với V (element-wise multiplication)
+        # F_output = F * V
+        #F_output = F * V # Ký hiệu (F) trong công thức (4)
+        
+        return F
+    
+class FAST_Module(nn.Module):
+    """
+    Khối FAST hoàn chỉnh bao gồm FSA, Layer Norm và MLP, theo công thức (4) và (5).
+    """
+    def __init__(self, ch_in, d_model, dropout=0.1):
+        super().__init__()
+        # Kích thước đầu vào (Kênh) và kích thước embedding (d_model)
+        self.ch_in = ch_in
+        self.d_model = d_model
+        
+        # --- 1. Conv2d Projections (thay cho Linear) ---
+        # Kernel size 1x1 thường được dùng cho phép chiếu không gian
+        kernel_size = 1 
+        
+        # SNR_map (s_i) -> Q (từ C_in -> d_model)
+        self.q_proj = nn.Conv2d(ch_in, d_model, kernel_size=kernel_size)
+        # RGB_feature (x_i) -> K, V (từ C_in -> d_model)
+        self.k_proj = nn.Conv2d(ch_in, d_model, kernel_size=kernel_size)
+        self.v_proj = nn.Conv2d(ch_in, d_model, kernel_size=kernel_size)
+        
+        # 2. Fourier SNR-guided Attention
+        self.fsa = FourierSNRGuidedAttention(d_model)
+        
+        # 3. Layer Normalization (LN)
+        # LN(F · V + x_i) 
+        self.norm1 = nn.LayerNorm(d_model) # Dựa trên x'_i = x_i + LN(F · V)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # 4. Multi-Layer Perceptron (MLP)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4), 
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
+        )
+        
+    def _prepare_for_attention(self, x_4d):
+        """ Chuyển đổi từ (B, C, H, W) sang (B, H*W, C) """
+        # (B, D, H, W) -> (B, D, H*W)
+        x_3d = x_4d.flatten(start_dim=2)
+        # (B, D, H*W) -> (B, H*W, D)
+        x_attn = x_3d.transpose(1, 2)
+        return x_attn
+    
+    def _recover_from_attention(self, x_attn, shape_4d):
+        """ Chuyển đổi từ (B, H*W, C) sang (B, C, H, W) """
+        B, C, H, W = shape_4d
+        # (B, H*W, C) -> (B, C, H*W)
+        x_3d = x_attn.transpose(1, 2)
+        # (B, C, H*W) -> (B, C, H, W)
+        x_4d = x_3d.view(B, C, H, W)
+        return x_4d
+
+    def forward(self, x_rgb, x_snr):
+        """
+        Args:
+            x_rgb (Tensor): RGB feature maps x_i (B, C, H, W)
+            x_snr (Tensor): SNR maps s_i (B, C, H, W)
+        """
+        # x_i_4d là (B, C, H, W), với C == D (d_model)
+        x_i_4d = x_rgb
+        
+        # 1. Projections (4D Conv)
+        Q_4d = self.q_proj(x_snr) # (B, D, H, W)
+        K_4d = self.k_proj(x_rgb) # (B, D, H, W)
+        V_4d = self.v_proj(x_rgb) # (B, D, H, W)
+
+        # 2. Chuẩn bị cho FSA (4D -> 3D)
+        Q_3d, shape_info = self._prepare_for_attention(Q_4d) # (B, S, D)
+        K_3d, _ = self._prepare_for_attention(K_4d)          # (B, S, D)
+        V_3d, _ = self._prepare_for_attention(V_4d)          # (B, S, D)
+
+        # 3. Fourier SNR-guided Attention (FSA)
+        F_3d = self.fsa(Q_3d, K_3d) # (B, S, D)
+        
+        # 4. Norm + Modulate (Giữ logic gốc)
+        attn_norm_3d = self.norm1(F_3d)
+        attn_3d = attn_norm_3d * V_3d # (B, S, D)
+        
+        # 5. Residual Connection 1
+        # Chuyển x_i sang 3D để cộng
+        x_i_3d, _ = self._prepare_for_attention(x_i_4d) # (B, S, D)
+        x_prime_3d = x_i_3d + attn_3d # (B, S, D)
+        
+        # 6. MLP Block (Công thức 5)
+        mlp_input_3d = self.norm2(x_prime_3d)
+        mlp_output_3d = self.mlp(mlp_input_3d)
+        
+        # 7. Residual Connection 2
+        x_out_3d = x_prime_3d + mlp_output_3d # (B, S, D)
+        
+        # 8. Chuyển về 4D
+        x_out_4d = self._recover_from_attention(x_out_3d, shape_info)
+        
+        return x_out_4d
+
 
 class PriorGuidedRE(nn.Module):
     def __init__(self, ch_in=3, down_depth=2):
@@ -1149,6 +1299,9 @@ class PriorGuidedRE(nn.Module):
         self.prior_downs = nn.ModuleList()
         self.up = nn.ModuleList()
         self.fusion = nn.ModuleList()
+
+        self.fast_modules = nn.ModuleList()
+
         self.fc = FeatureContextualizer(ch_in=self.ch_in * 2 ** self.down_depth,
                                  ch_out=self.ch_in * 2 ** (self.down_depth + 1),
                                  dim=48)
@@ -1169,15 +1322,30 @@ class PriorGuidedRE(nn.Module):
             self.dr.append(DetailRestorer(self.ch_in * 2 ** i))
             self.fusion.append(ScaleHarmonizer(self.ch_in * 2 ** (i + 1), self.ch_in * 2 ** i))
 
+            if i < self.down_depth:
+                # FAST_Module yêu cầu ch_in == d_model
+                d_model = ch_in * 2 ** i
+                self.fast_modules.append(FAST_Module(ch_in=ch_in * 2 ** i, d_model=d_model))
+
 
     def forward(self, x, prior):
         dr_res = []
+        prior_levels = [] # Danh sách mới để lưu prior ở mọi cấp độ
+
         dr_res.append(self.dr[0](x))
-        prior_low = prior
+        prior_levels.append(prior) # Lưu prior gốc (cấp độ 0)
+
+        #prior_low = prior
         for i, (down, prior_down) in enumerate(zip(self.downs, self.prior_downs)):
             low = down(dr_res[i])
             dr_res.append(self.dr[i + 1](low))
-            prior_low = prior_down(prior_low)
+            #prior_low = prior_down(prior_low)
+            # Downsample prior từ cấp độ trước và lưu lại
+            current_prior = prior_down(prior_levels[-1]) 
+            prior_levels.append(current_prior)
+
+        # Lấy prior ở mức thấp nhất
+        prior_low = prior_levels[-1]
 
         fusion_res = []
 
@@ -1186,7 +1354,15 @@ class PriorGuidedRE(nn.Module):
 
         for i in reversed(range(0, self.down_depth)):
             fusion_res[-1] = self.up[i](fusion_res[-1])
-            fusion_in = torch.cat((fusion_res[-1], dr_res[i]), dim=1)
+
+            # Lấy dr_res và prior tương ứng tại cấp độ 'i'
+            current_dr = dr_res[i]
+            current_prior = prior_levels[i]
+            
+            # Gửi chúng qua FAST_Module
+            fast_output = self.fast_modules[i](current_dr, current_prior)
+            fusion_in = torch.cat((fusion_res[-1], fast_output), dim=1)
+            #fusion_in = torch.cat((fusion_res[-1], dr_res[i]), dim=1)
             fusion_res.append(self.fusion[i](fusion_in))
 
         out = torch.cat((x, fusion_res[-1], prior), dim=1)
