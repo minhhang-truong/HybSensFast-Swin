@@ -1345,7 +1345,7 @@ class PriorGuidedRE(nn.Module):
             dr_res.append(self.dr[i + 1](low))
             #prior_low = prior_down(prior_low)
             # Downsample prior từ cấp độ trước và lưu lại
-            current_prior = self.prior_r[0](current_prior)
+            current_prior = self.prior_r[i](current_prior)
             prior_levels.append(current_prior) # Lưu prior gốc (cấp độ 0)
             current_prior = prior_down(prior_levels[-1]) 
 
