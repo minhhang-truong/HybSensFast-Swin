@@ -1138,7 +1138,7 @@ class ColorBalancePrior(nn.Module):
 
         return prior
 
-from swin_transformer_v2 import BasicLayer
+from models.swin_transformer_v2 import BasicLayer
 
 class FAST_Swin_Module(nn.Module):
     """
