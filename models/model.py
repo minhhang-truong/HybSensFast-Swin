@@ -1146,8 +1146,7 @@ class FAST_Swin_Module(nn.Module):
     Thay thế Global Attention bằng Swin Transformer Block (BasicLayer).
     Sử dụng SNR/Color Prior để làm cổng (Gating) cho đầu ra của Swin.
     """
-    def __init__(self, ch_in, d_model, input_resolution, 
-                 window_size=8, depth=2, num_heads=4, dropout=0.1):
+    def __init__(self, ch_in, d_model, window_size=8, depth=2, num_heads=4, dropout=0.1, input_resolution=(64, 64)):
         """
         Args:
             ch_in: Số kênh input
