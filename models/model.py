@@ -1257,8 +1257,9 @@ class FAST_Swin_Module(nn.Module):
 
 
 class PriorGuidedRE(nn.Module):
-    def __init__(self, ch_in=3, down_depth=2):
+    def __init__(self, ch_in=3, down_depth=2, img_size=256):
         super(PriorGuidedRE, self).__init__()
+        self.img_size = img_size
         self.ch_in = ch_in
         self.down_depth = down_depth
 
@@ -1305,7 +1306,8 @@ class PriorGuidedRE(nn.Module):
             if i < self.down_depth:
                 # FAST_Module yêu cầu ch_in == d_model
                 d_model = ch_in * 2 ** i
-                self.fast_modules.append(FAST_Swin_Module(ch_in=ch_in * 2 ** i, d_model=d_model))
+                current_res = self.img_size // (2 ** i)
+                self.fast_modules.append(FAST_Swin_Module(ch_in=ch_in * 2 ** i, d_model=d_model, input_resolution=(current_res, current_res)))
 
 
     def forward(self, x, prior):
@@ -1351,13 +1353,18 @@ class PriorGuidedRE(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self, img_size=256):
         super(Model, self).__init__()
         self.ch_in = 3
         self.down_depth = 2
 
         self.prior = ColorBalancePrior(self.ch_in)
-        self.re = PriorGuidedRE(self.ch_in, self.down_depth)
+        # 2. Truyền img_size xuống cho PriorGuidedRE
+        self.re = PriorGuidedRE(
+            ch_in=self.ch_in, 
+            down_depth=self.down_depth, 
+            img_size=img_size # <--- QUAN TRỌNG: Truyền tiếp giá trị này xuống
+        )
 
     def forward(self, x):
         illum_prior = self.prior(x)
