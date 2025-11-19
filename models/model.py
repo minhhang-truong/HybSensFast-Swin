@@ -1138,104 +1138,62 @@ class ColorBalancePrior(nn.Module):
 
         return prior
 
+from swin_transformer_v2 import BasicLayer
 
-class GuidedMDTA(nn.Module):
+class FAST_Swin_Module(nn.Module):
     """
-    Guided Multi-Dconv Head Transposed Attention (MDTA) từ Restormer.
-    Thay đổi: Q được tạo từ SNR feature, K và V được tạo từ RGB feature.
+    FAST Module phiên bản Swin Transformer.
+    Thay thế Global Attention bằng Swin Transformer Block (BasicLayer).
+    Sử dụng SNR/Color Prior để làm cổng (Gating) cho đầu ra của Swin.
     """
-    def __init__(self, dim, num_heads):
-        super().__init__()
-
-        while dim % num_heads != 0 and num_heads > 1:
-            num_heads -= 1
-            
-        self.num_heads = num_heads
-        self.dim = dim
-        self.head_dim = dim // num_heads
-        # Scale parameter có thể học được (thay vì chia cho sqrt(d_k) cố định)
-        self.scale = nn.Parameter(torch.ones(num_heads, 1, 1))
-
-        # 1. Projections với Depth-wise Convolution (đặc trưng của Restormer)
-        # Q projection cho SNR
-        self.q_proj = nn.Sequential(
-            nn.Conv2d(dim, dim, 1, bias=False),
-            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False) # Depth-wise
-        )
-        # K projection cho RGB
-        self.k_proj = nn.Sequential(
-            nn.Conv2d(dim, dim, 1, bias=False),
-            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False) # Depth-wise
-        )
-        # V projection cho RGB
-        self.v_proj = nn.Sequential(
-            nn.Conv2d(dim, dim, 1, bias=False),
-            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False) # Depth-wise
-        )
-
-        # Output projection
-        self.proj_out = nn.Conv2d(dim, dim, 1, bias=False)
-
-    def forward(self, x_rgb, x_snr):
+    def __init__(self, ch_in, d_model, input_resolution, 
+                 window_size=8, depth=2, num_heads=4, dropout=0.1):
         """
         Args:
-            x_rgb: (B, C, H, W)
-            x_snr: (B, C, H, W)
+            ch_in: Số kênh input
+            d_model: Số kênh feature (dim)
+            input_resolution (tuple): Kích thước (H, W) CỐ ĐỊNH của feature map. Swin cần cái này.
+            window_size: Kích thước cửa sổ Swin.
+            depth: Số lượng khối Swin Transformer (độ sâu của BasicLayer).
+            num_heads: Số lượng attention heads.
         """
-        B, C, H, W = x_rgb.shape
-
-        # 1. Tạo Q, K, V
-        q = self.q_proj(x_snr)
-        k = self.k_proj(x_rgb)
-        v = self.v_proj(x_rgb)
-
-        # 2. Reshape để thực hiện Transposed Attention
-        # Chuyển từ (B, C, H, W) -> (B, num_heads, head_dim, H*W)
-        q = q.reshape(B, self.num_heads, self.head_dim, -1)
-        k = k.reshape(B, self.num_heads, self.head_dim, -1)
-        v = v.reshape(B, self.num_heads, self.head_dim, -1)
-
-        # 3. Normalize Q và K (quan trọng cho MDTA để ổn định training)
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-
-        # 4. Tính Attention Map trên kênh (Channel-wise)
-        # (B, heads, head_dim, HW) @ (B, heads, HW, head_dim) -> (B, heads, head_dim, head_dim)
-        # Kết quả là ma trận tương quan kích thước (head_dim x head_dim)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        # 5. Áp dụng Attention vào V
-        # (B, heads, head_dim, head_dim) @ (B, heads, head_dim, HW) -> (B, heads, head_dim, HW)
-        out = (attn @ v)
-
-        # 6. Reshape lại về 4D ban đầu
-        out = out.reshape(B, C, H, W)
-
-        # 7. Projection cuối
-        out = self.proj_out(out)
-
-        return out
-    
-class FAST_Module_MDTA(nn.Module):
-
-    def __init__(self, ch_in, d_model, num_heads=8, dropout=0.1):
         super().__init__()
-        self.d_model = d_model
-
-        # Input embedding nếu số kênh đầu vào khác d_model
-        self.rgb_embed = nn.Conv2d(ch_in, d_model, 1) if ch_in != d_model else nn.Identity()
-        self.prior_embed = nn.Conv2d(ch_in, d_model, 1) if ch_in != d_model else nn.Identity()
-
-        # 1. Thay thế FourierSNRGuidedAttention bằng GuidedMDTA
-        # Restormer attention hoạt động tốt với Norm trước (Pre-norm) nhưng ở dạng 4D.
-        # Chúng ta có thể dùng LayerNorm 4D hoặc GroupNorm. Restormer gốc dùng LayerNorm nhưng implement đặc biệt cho 4D.
-        # Để đơn giản và tương thích với code cũ của bạn, tôi sẽ dùng một mẹo nhỏ cho LayerNorm 4D.
-        self.norm1 = nn.LayerNorm(d_model) 
-        self.attn = GuidedMDTA(dim=d_model, num_heads=num_heads)
-
-        # 2. Giữ nguyên phần MLP cũ của bạn (hoặc có thể nâng cấp lên GDFN của Restormer)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.input_resolution = input_resolution
+        
+        # 1. Adapter: Chuyển số kênh input về d_model (nếu cần)
+        # Input (B, C_in, H, W) -> (B, d_model, H, W)
+        self.input_proj = nn.Conv2d(ch_in, d_model, kernel_size=1)
+        
+        # 2. Swin Transformer Component (Thay thế cho FSA)
+        # Sử dụng BasicLayer từ model.py. 
+        # BasicLayer bao gồm nhiều SwinTransformerBlock và hỗ trợ Shifted Window.
+        self.swin_layer = BasicLayer(
+            dim=d_model,
+            input_resolution=input_resolution,
+            depth=depth,                # Số lượng block Swin chồng lên nhau (thường là 2)
+            num_heads=num_heads,
+            window_size=window_size,
+            mlp_ratio=4.,
+            qkv_bias=True,
+            drop=dropout,
+            attn_drop=dropout,
+            drop_path=0.1,              # Stochastic depth
+            norm_layer=nn.LayerNorm,
+            downsample=None,            # Quan trọng: Không downsample để giữ nguyên kích thước
+            use_checkpoint=False
+        )
+        
+        # 3. Prior Gating (Thay thế cho vai trò Q của SNR)
+        # Biến đổi SNR/Color Prior thành một cái cổng (Mask) để điều hướng feature
+        self.gate_proj = nn.Sequential(
+            nn.Conv2d(ch_in, d_model, kernel_size=1),
+            nn.SiLU(),                  # Activation function hiện đại hơn ReLU
+            nn.Conv2d(d_model, d_model, kernel_size=1),
+            nn.Sigmoid()                # Đưa về [0, 1]
+        )
+        
+        # 4. Phần còn lại của FAST (Norm + MLP)
+        self.norm = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -1244,41 +1202,59 @@ class FAST_Module_MDTA(nn.Module):
             nn.Dropout(dropout)
         )
 
-
     def forward(self, x_rgb, x_prior):
-
-        # Đảm bảo đầu vào có số kênh là d_model
-        x_rgb = self.rgb_embed(x_rgb)
-        x_prior = self.prior_embed(x_prior)
-
+        """
+        Args:
+            x_rgb: Feature map chính (B, C, H, W)
+            x_prior: SNR map hoặc Color Prior (B, C, H, W)
+        """
         B, C, H, W = x_rgb.shape
-        residual = x_rgb
+        
+        # Kiểm tra kích thước (Swin rất nhạy cảm với việc thay đổi H, W động)
+        assert (H, W) == self.input_resolution, \
+            f"Input resolution {(H,W)} không khớp với khai báo {(self.input_resolution)}"
 
-        # --- Block 1: Guided MDTA ---
-        # Cần chuyển về dạng (B, H, W, C) để dùng nn.LayerNorm chuẩn, rồi chuyển lại
-        x_norm = self.norm1(x_rgb.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        s_norm = self.norm1(x_prior.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # --- A. Chuẩn bị dữ liệu ---
+        # Project về d_model
+        x_feat = self.input_proj(x_rgb)  # (B, D, H, W)
+        
+        # Chuyển sang dạng Channel-last cho Swin: (B, H, W, D)
+        x_swin_in = x_feat.permute(0, 2, 3, 1)
+        
+        # --- B. SWIN TRANSFORMER (Feature Extraction) ---
+        # Input BasicLayer thường yêu cầu (B, H*W, C) hoặc (B, H, W, C) tùy code model.py
+        # Trong code gốc Swin v1/v2, BasicLayer nhận vào (B, L, C) với L=H*W
+        x_swin_in_flat = x_swin_in.view(B, H*W, self.input_proj.out_channels)
+        
+        # Chạy qua Swin BasicLayer
+        x_swin_out_flat = self.swin_layer(x_swin_in_flat)
+        
+        # Reshape lại thành (B, H, W, D)
+        x_swin_out = x_swin_out_flat.view(B, H, W, -1)
 
-        # MDTA thực hiện trên 4D tensor
-        attn_out = self.attn(x_norm, s_norm)
+        # --- C. PRIOR GATING (Feature Modulation) ---
+        # Tạo cổng từ Prior (SNR/Color)
+        gate = self.gate_proj(x_prior)   # (B, D, H, W)
+        gate = gate.permute(0, 2, 3, 1)  # (B, H, W, D)
+        
+        # Nhân cổng: Vùng nào Prior "thích" thì giữ lại feature của Swin
+        x_guided = x_swin_out * gate
 
-        # Residual connection 1
-        x = residual + attn_out
-
-        # --- Block 2: MLP (giữ nguyên logic cũ trên 3D/channel-last) ---
-        residual = x
-        # Reshape cho MLP: (B, C, H, W) -> (B, H, W, C)
-        x_channels_last = x.permute(0, 2, 3, 1)
-        x_norm = self.norm2(x_channels_last)
-        mlp_out = self.mlp(x_norm)
-
-
-        # Reshape lại về 4D: (B, H, W, C) -> (B, C, H, W)
-        mlp_out = mlp_out.permute(0, 3, 1, 2)
-
-        # Residual connection 2
-        x = residual + mlp_out
-        return x
+        # --- D. RESIDUAL & MLP (Cấu trúc FAST) ---
+        # Residual 1: Cộng với input gốc (đã permute)
+        x_res1 = x_swin_in + x_guided
+        
+        # Norm & MLP
+        x_norm = self.norm(x_res1)
+        x_mlp = self.mlp(x_norm)
+        
+        # Residual 2
+        x_out = x_res1 + x_mlp
+        
+        # --- E. Trả về (B, C, H, W) ---
+        x_out = x_out.permute(0, 3, 1, 2)
+        
+        return x_out
 
 
 class PriorGuidedRE(nn.Module):
@@ -1330,7 +1306,7 @@ class PriorGuidedRE(nn.Module):
             if i < self.down_depth:
                 # FAST_Module yêu cầu ch_in == d_model
                 d_model = ch_in * 2 ** i
-                self.fast_modules.append(FAST_Module_MDTA(ch_in=ch_in * 2 ** i, d_model=d_model))
+                self.fast_modules.append(FAST_Swin_Module(ch_in=ch_in * 2 ** i, d_model=d_model))
 
 
     def forward(self, x, prior):
