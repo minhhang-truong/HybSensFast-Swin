@@ -1309,7 +1309,7 @@ class PriorGuidedRE(nn.Module):
             self.fusion.append(ScaleHarmonizer(self.ch_in * 2 ** (i + 1), self.ch_in * 2 ** i))
 
             if i < self.down_depth:
-                current_res = self.img_size // (2 ** (i + 1)) 
+                current_res = self.img_size // (2 ** i) 
         
                 # GỌI MODULE FAST
                 self.fast_modules.append(
