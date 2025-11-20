@@ -1201,6 +1201,10 @@ class FAST_Swin_Module(nn.Module):
             nn.Dropout(dropout)
         )
 
+        # 5. Adapter Output: Thu nhỏ từ d_model (96) về lại ch_in (3, 6) 
+        # để khớp với các layer sau của mạng UNet
+        self.output_proj = nn.Conv2d(d_model, ch_in, kernel_size=1)
+
     def forward(self, x_rgb, x_prior):
         """
         Args:
@@ -1223,7 +1227,7 @@ class FAST_Swin_Module(nn.Module):
         # --- B. SWIN TRANSFORMER (Feature Extraction) ---
         # Input BasicLayer thường yêu cầu (B, H*W, C) hoặc (B, H, W, C) tùy code model.py
         # Trong code gốc Swin v1/v2, BasicLayer nhận vào (B, L, C) với L=H*W
-        x_swin_in_flat = x_swin_in.view(B, H*W, self.input_proj.out_channels)
+        x_swin_in_flat = x_swin_in.view(B, H*W, -1)
         
         # Chạy qua Swin BasicLayer
         x_swin_out_flat = self.swin_layer(x_swin_in_flat)
@@ -1248,10 +1252,11 @@ class FAST_Swin_Module(nn.Module):
         x_mlp = self.mlp(x_norm)
         
         # Residual 2
-        x_out = x_res1 + x_mlp
+        x_out_high_dim = x_res1 + x_mlp # Vẫn là (B, H, W, 96)
         
-        # --- E. Trả về (B, C, H, W) ---
-        x_out = x_out.permute(0, 3, 1, 2)
+        # --- E. Thu nhỏ về ch_in (ví dụ 96 -> 3) ---
+        x_out_high_dim = x_out_high_dim.permute(0, 3, 1, 2) # (B, 96, H, W)
+        x_out = self.output_proj(x_out_high_dim) # (B, 3, H, W)
         
         return x_out
 
@@ -1304,10 +1309,16 @@ class PriorGuidedRE(nn.Module):
             self.fusion.append(ScaleHarmonizer(self.ch_in * 2 ** (i + 1), self.ch_in * 2 ** i))
 
             if i < self.down_depth:
-                # FAST_Module yêu cầu ch_in == d_model
-                d_model = ch_in * 2 ** i
-                current_res = self.img_size // (2 ** i)
-                self.fast_modules.append(FAST_Swin_Module(ch_in=ch_in * 2 ** i, d_model=d_model, input_resolution=(current_res, current_res)))
+                current_res = self.img_size // (2 ** (i + 1)) 
+        
+                # GỌI MODULE FAST
+                self.fast_modules.append(
+                    FAST_Swin_Module(
+                        ch_in=ch_in * 2 ** i,    # Vẫn giữ 3, 6, 12...
+                        d_model=96,              # <--- CỐ ĐỊNH SỐ NÀY (phải chia hết cho num_heads=4)
+                        input_resolution=(current_res, current_res)
+                    )
+                )
 
 
     def forward(self, x, prior):
